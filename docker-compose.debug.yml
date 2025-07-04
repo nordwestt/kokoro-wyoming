@@ -1,0 +1,7 @@
+services:
+  app:
+    extends:
+      service: app
+      file: docker-compose.yml
+    command:
+      - --debug
