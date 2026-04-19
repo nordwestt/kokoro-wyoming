@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
+"""Wyoming protocol server for Kokoro TTS.
+
+Wraps kokoro-onnx in a Wyoming-compatible TCP server for use with
+Home Assistant and other Wyoming clients.
+"""
 import argparse
 import asyncio
 import logging
 import signal
+import sys
+import time
 from functools import partial
 from typing import Optional
 
@@ -21,35 +28,15 @@ from wyoming.event import Event
 import re
 
 _LOGGER = log.getChild(__name__)
-VERSION = "0.1"
+VERSION = "0.2.0"
 
 
 def split_into_sentences(text: str) -> list[str]:
-    """
-    Split text into sentences using punctuation boundaries.
-    
-    Args:
-        text: Input text to split
-        
-    Returns:
-        List of sentences
-        
-    Example:
-        >>> text = "Hello world! How are you? I'm doing great."
-        >>> split_into_sentences(text)
-        ['Hello world!', 'How are you?', "I'm doing great."]
-    """
-    # First normalize whitespace and clean the text
+    """Split text into sentences using punctuation boundaries."""
     text = ' '.join(text.strip().split())
-
-    # Split on sentence boundaries
     pattern = r'(?<=[.!?])\s+'
     sentences = re.split(pattern, text)
-
-    # Filter out empty strings and strip whitespace
-    sentences = [s.strip() for s in sentences if s.strip()]
-
-    return sentences
+    return [s.strip() for s in sentences if s.strip()]
 
 
 def get_model_voices(model: Kokoro) -> list[TtsVoice]:
@@ -81,12 +68,13 @@ def get_model_voices(model: Kokoro) -> list[TtsVoice]:
 
 class KokoroEventHandler(AsyncEventHandler):
     def __init__(self, wyoming_info: Info, kokoro_instance,
-                 *args,
-                 **kwargs):
+                 default_voice: str, default_speed: float,
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.kokoro = kokoro_instance
-        self.args = args
+        self.default_voice = default_voice
+        self.default_speed = default_speed
         self.wyoming_info_event = wyoming_info.event()
 
     async def handle_event(self, event: Event) -> bool:
@@ -108,32 +96,29 @@ class KokoroEventHandler(AsyncEventHandler):
             )
             raise err
 
-    """Handle text to speech synthesis request."""
-
     async def _handle_synthesize(self, event: Event) -> Optional[bool]:
         try:
             synthesize = Synthesize.from_event(event)
+            t_start = time.monotonic()
 
-            # Get voice settings
-            voice_name = "af_heart"  # default voice
-            if synthesize.voice:
+            voice_name = self.default_voice
+            if synthesize.voice and synthesize.voice.name:
                 voice_name = synthesize.voice.name
 
             sentences = split_into_sentences(synthesize.text)
 
             i = 0
             t_bytes = 0
+            t_first_audio = None
             for sentence in sentences:
-                # Create audio stream
                 stream = self.kokoro.create_stream(
                     sentence,
                     voice=voice_name,
-                    speed=1.0,
+                    speed=self.default_speed,
                     lang="en-us" if voice_name.startswith("a") else "en-gb"
                 )
 
                 if i == 0:
-                    # Send audio start
                     await self.write_event(
                         AudioStart(
                             rate=kokoro_onnx.config.SAMPLE_RATE,
@@ -143,15 +128,13 @@ class KokoroEventHandler(AsyncEventHandler):
                     )
                     i += 1
 
-                # Process each chunk from the stream
                 async for audio, sample_rate in stream:
-                    # Convert float32 to int16
+                    if t_first_audio is None:
+                        t_first_audio = time.monotonic()
                     audio_int16 = (audio * 32767).astype(np.int16)
                     audio_bytes = audio_int16.tobytes()
-
                     t_bytes += len(audio_bytes)
 
-                    # Send audio chunk
                     await self.write_event(
                         AudioChunk(
                             audio=audio_bytes,
@@ -161,11 +144,18 @@ class KokoroEventHandler(AsyncEventHandler):
                         ).event()
                     )
 
-            # Send audio stop
-            await self.write_event(
-                AudioStop().event())
+            await self.write_event(AudioStop().event())
 
-            _LOGGER.debug('Synthesized %d bytes from %s', t_bytes, repr(synthesize))
+            t_done = time.monotonic()
+            first_ms = (t_first_audio - t_start) * 1000 if t_first_audio else 0
+            total_ms = (t_done - t_start) * 1000
+            audio_dur = t_bytes / (kokoro_onnx.config.SAMPLE_RATE * 2)
+            _LOGGER.info(
+                "Synthesized: voice=%s, first_audio=%.0fms, total=%.0fms, "
+                "audio=%.1fs, %d bytes, text=\"%s\"",
+                voice_name, first_ms, total_ms, audio_dur, t_bytes,
+                synthesize.text[:80],
+            )
 
             return True
 
@@ -175,22 +165,45 @@ class KokoroEventHandler(AsyncEventHandler):
 
 async def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Host to listen on"
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=10200,
-        help="Port to listen on"
+    parser = argparse.ArgumentParser(
+        description="Wyoming protocol server for Kokoro TTS"
     )
     parser.add_argument(
         "--uri",
         default="tcp://0.0.0.0:10210",
-        help="unix:// or tcp://"
+        help="Server URI (default: tcp://0.0.0.0:10210)"
+    )
+    parser.add_argument(
+        "--voice",
+        default="af_heart",
+        help="Default voice ID (default: af_heart). "
+             "Use --list-voices to see available voices."
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="Speech speed multiplier (default: 1.0)"
+    )
+    parser.add_argument(
+        "--model",
+        default="kokoro-v1.0.onnx",
+        help="Path to ONNX model file (default: kokoro-v1.0.onnx)"
+    )
+    parser.add_argument(
+        "--voices",
+        default="voices-v1.0.bin",
+        help="Path to voices file (default: voices-v1.0.bin)"
+    )
+    parser.add_argument(
+        "--list-voices",
+        action="store_true",
+        help="List available voices and exit"
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Skip warmup synthesis at startup"
     )
     parser.add_argument(
         "--debug",
@@ -202,33 +215,70 @@ async def main():
     if args.debug:
         log.setLevel(level=logging.DEBUG)
 
-    kokoro_instance = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
-    wyoming_voices = get_model_voices(kokoro_instance)
+    _LOGGER.info("Loading model: %s", args.model)
+    kokoro_instance = Kokoro(args.model, args.voices)
 
+    if args.list_voices:
+        for voice_id in sorted(kokoro_instance.voices.keys()):
+            print(voice_id)
+        return
+
+    if args.voice not in kokoro_instance.voices:
+        _LOGGER.error(
+            "Voice '%s' not found. Available: %s",
+            args.voice,
+            ", ".join(sorted(kokoro_instance.voices.keys()))
+        )
+        sys.exit(1)
+
+    if not args.no_warmup:
+        _LOGGER.info("Warming up with voice '%s'...", args.voice)
+        t_warmup = time.monotonic()
+        kokoro_instance.create("warmup", voice=args.voice, speed=args.speed)
+        _LOGGER.info(
+            "Warmup complete in %.0fms",
+            (time.monotonic() - t_warmup) * 1000
+        )
+
+    wyoming_voices = get_model_voices(kokoro_instance)
     wyoming_info = Info(
         tts=[TtsProgram(
             name="Kokoro",
-            description="A fast, local, kokoro-based tts engine",
+            description="Kokoro TTS via Wyoming protocol",
             attribution=Attribution(
                 name="Kokoro TTS",
                 url="https://huggingface.co/hexgrad/Kokoro-82M",
             ),
             installed=True,
             voices=sorted(wyoming_voices, key=lambda v: v.name),
-            version="1.5.0"
+            version=VERSION,
         )]
     )
 
-    _LOGGER.info('Kokoro Onyx server starting on %s', args.uri)
+    _LOGGER.info(
+        "Starting on %s (voice=%s, speed=%.1f)",
+        args.uri, args.voice, args.speed
+    )
     server = AsyncServer.from_uri(args.uri)
 
-    # Handle OS signals
-    loop = asyncio.get_event_loop()
-    for s in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(s, lambda: asyncio.create_task(server.stop()))
+    try:
+        loop = asyncio.get_event_loop()
+        for s in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(
+                s, lambda: asyncio.create_task(server.stop())
+            )
+    except (NotImplementedError, OSError):
+        _LOGGER.debug("Signal handlers not available (container environment)")
 
-    # Start server with kokoro instance
-    await server.run(partial(KokoroEventHandler, wyoming_info, kokoro_instance))
+    await server.run(
+        partial(
+            KokoroEventHandler,
+            wyoming_info,
+            kokoro_instance,
+            args.voice,
+            args.speed,
+        )
+    )
 
 
 if __name__ == "__main__":
