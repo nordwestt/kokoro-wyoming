@@ -6,10 +6,12 @@ Home Assistant and other Wyoming clients.
 """
 import argparse
 import asyncio
+import hashlib
 import logging
 import signal
 import sys
 import time
+from collections import OrderedDict
 from functools import partial
 from typing import Optional
 
@@ -28,7 +30,13 @@ from wyoming.event import Event
 import re
 
 _LOGGER = log.getChild(__name__)
-VERSION = "0.2.0"
+VERSION = "0.3.0"
+
+# Maximum text length to prevent resource exhaustion on extremely long inputs.
+_MAX_TEXT_LENGTH = 5000
+
+# Maximum number of cached synthesis results to keep in memory.
+_MAX_CACHE_ENTRIES = 128
 
 
 def split_into_sentences(text: str) -> list[str]:
@@ -37,6 +45,24 @@ def split_into_sentences(text: str) -> list[str]:
     pattern = r'(?<=[.!?])\s+'
     sentences = re.split(pattern, text)
     return [s.strip() for s in sentences if s.strip()]
+
+
+def clean_text(text: str) -> str:
+    """Strip markup artifacts that LLMs sometimes include in responses.
+
+    Removes markdown bold/italic markers, heading markers, and other
+    formatting that shouldn't be spoken aloud.
+    """
+    # Strip markdown bold/italic: **text** or __text__ or *text* or _text_
+    text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)
+    text = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', text)
+    # Strip markdown headings: ## Heading
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Strip bullet points: - item or * item
+    text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
+    # Collapse multiple spaces/newlines
+    text = ' '.join(text.split())
+    return text.strip()
 
 
 def get_model_voices(model: Kokoro) -> list[TtsVoice]:
@@ -66,9 +92,50 @@ def get_model_voices(model: Kokoro) -> list[TtsVoice]:
     ]
 
 
+class SynthesisCache:
+    """LRU cache for synthesis results, keyed on (text, voice, speed)."""
+
+    def __init__(self, max_entries: int = _MAX_CACHE_ENTRIES):
+        self._cache: OrderedDict[str, tuple[np.ndarray, int]] = OrderedDict()
+        self._max = max_entries
+        self._hits = 0
+        self._misses = 0
+
+    def _key(self, text: str, voice: str, speed: float) -> str:
+        return hashlib.md5(
+            f"{text}|{voice}|{speed}".encode()
+        ).hexdigest()
+
+    def get(self, text: str, voice: str, speed: float
+            ) -> Optional[tuple[np.ndarray, int]]:
+        k = self._key(text, voice, speed)
+        if k in self._cache:
+            self._cache.move_to_end(k)
+            self._hits += 1
+            return self._cache[k]
+        self._misses += 1
+        return None
+
+    def put(self, text: str, voice: str, speed: float,
+            audio: np.ndarray, sr: int) -> None:
+        k = self._key(text, voice, speed)
+        self._cache[k] = (audio, sr)
+        self._cache.move_to_end(k)
+        if len(self._cache) > self._max:
+            self._cache.popitem(last=False)
+
+    @property
+    def stats(self) -> str:
+        total = self._hits + self._misses
+        rate = (self._hits / total * 100) if total else 0
+        return f"{self._hits}/{total} hits ({rate:.0f}%)"
+
+
 class KokoroEventHandler(AsyncEventHandler):
     def __init__(self, wyoming_info: Info, kokoro_instance,
                  default_voice: str, default_speed: float,
+                 synth_semaphore: asyncio.Semaphore,
+                 cache: SynthesisCache,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -76,6 +143,8 @@ class KokoroEventHandler(AsyncEventHandler):
         self.default_voice = default_voice
         self.default_speed = default_speed
         self.wyoming_info_event = wyoming_info.event()
+        self._semaphore = synth_semaphore
+        self._cache = cache
 
     async def handle_event(self, event: Event) -> bool:
         """Handle Wyoming protocol events."""
@@ -105,46 +174,97 @@ class KokoroEventHandler(AsyncEventHandler):
             if synthesize.voice and synthesize.voice.name:
                 voice_name = synthesize.voice.name
 
-            sentences = split_into_sentences(synthesize.text)
+            # Clean markup from LLM output and validate
+            text = clean_text(synthesize.text)
 
-            i = 0
-            t_bytes = 0
-            t_first_audio = None
-            for sentence in sentences:
-                stream = self.kokoro.create_stream(
-                    sentence,
-                    voice=voice_name,
-                    speed=self.default_speed,
-                    lang="en-us" if voice_name.startswith("a") else "en-gb"
+            if not text:
+                _LOGGER.warning("Empty text after cleaning, skipping synthesis")
+                await self.write_event(AudioStart(
+                    rate=kokoro_onnx.config.SAMPLE_RATE, width=2, channels=1
+                ).event())
+                await self.write_event(AudioStop().event())
+                return True
+
+            if len(text) > _MAX_TEXT_LENGTH:
+                _LOGGER.warning(
+                    "Text truncated from %d to %d chars", len(text), _MAX_TEXT_LENGTH
                 )
+                text = text[:_MAX_TEXT_LENGTH]
 
-                if i == 0:
-                    await self.write_event(
-                        AudioStart(
-                            rate=kokoro_onnx.config.SAMPLE_RATE,
-                            width=2,
-                            channels=1,
-                        ).event()
+            # Check cache for exact match (common for repeated phrases)
+            cached = self._cache.get(text, voice_name, self.default_speed)
+            if cached is not None:
+                audio, sr = cached
+                audio_int16 = (audio * 32767).astype(np.int16)
+                audio_bytes = audio_int16.tobytes()
+                await self.write_event(AudioStart(
+                    rate=sr, width=2, channels=1
+                ).event())
+                await self.write_event(AudioChunk(
+                    audio=audio_bytes, rate=sr, width=2, channels=1
+                ).event())
+                await self.write_event(AudioStop().event())
+                t_done = time.monotonic()
+                _LOGGER.info(
+                    "Cache hit: voice=%s, %.0fms, text=\"%s\"",
+                    voice_name, (t_done - t_start) * 1000, text[:80]
+                )
+                return True
+
+            sentences = split_into_sentences(text)
+
+            # Serialize synthesis to prevent concurrent ONNX inference
+            # from competing for CPU and degrading latency for all clients.
+            async with self._semaphore:
+                i = 0
+                t_bytes = 0
+                t_first_audio = None
+                all_audio = []
+
+                for sentence in sentences:
+                    stream = self.kokoro.create_stream(
+                        sentence,
+                        voice=voice_name,
+                        speed=self.default_speed,
+                        lang="en-us" if voice_name.startswith("a") else "en-gb"
                     )
-                    i += 1
 
-                async for audio, sample_rate in stream:
-                    if t_first_audio is None:
-                        t_first_audio = time.monotonic()
-                    audio_int16 = (audio * 32767).astype(np.int16)
-                    audio_bytes = audio_int16.tobytes()
-                    t_bytes += len(audio_bytes)
+                    if i == 0:
+                        await self.write_event(
+                            AudioStart(
+                                rate=kokoro_onnx.config.SAMPLE_RATE,
+                                width=2,
+                                channels=1,
+                            ).event()
+                        )
+                        i += 1
 
-                    await self.write_event(
-                        AudioChunk(
-                            audio=audio_bytes,
-                            rate=kokoro_onnx.config.SAMPLE_RATE,
-                            width=2,
-                            channels=1,
-                        ).event()
-                    )
+                    async for audio, sample_rate in stream:
+                        if t_first_audio is None:
+                            t_first_audio = time.monotonic()
+                        all_audio.append(audio)
+                        audio_int16 = (audio * 32767).astype(np.int16)
+                        audio_bytes = audio_int16.tobytes()
+                        t_bytes += len(audio_bytes)
+
+                        await self.write_event(
+                            AudioChunk(
+                                audio=audio_bytes,
+                                rate=kokoro_onnx.config.SAMPLE_RATE,
+                                width=2,
+                                channels=1,
+                            ).event()
+                        )
 
             await self.write_event(AudioStop().event())
+
+            # Cache the result for future requests
+            if all_audio:
+                combined = np.concatenate(all_audio)
+                self._cache.put(
+                    text, voice_name, self.default_speed,
+                    combined, kokoro_onnx.config.SAMPLE_RATE
+                )
 
             t_done = time.monotonic()
             first_ms = (t_first_audio - t_start) * 1000 if t_first_audio else 0
@@ -152,9 +272,9 @@ class KokoroEventHandler(AsyncEventHandler):
             audio_dur = t_bytes / (kokoro_onnx.config.SAMPLE_RATE * 2)
             _LOGGER.info(
                 "Synthesized: voice=%s, first_audio=%.0fms, total=%.0fms, "
-                "audio=%.1fs, %d bytes, text=\"%s\"",
+                "audio=%.1fs, %d bytes, cache=%s, text=\"%s\"",
                 voice_name, first_ms, total_ms, audio_dur, t_bytes,
-                synthesize.text[:80],
+                self._cache.stats, synthesize.text[:80],
             )
 
             return True
@@ -206,6 +326,12 @@ async def main():
         help="Skip warmup synthesis at startup"
     )
     parser.add_argument(
+        "--max-cache",
+        type=int,
+        default=_MAX_CACHE_ENTRIES,
+        help=f"Max cached synthesis results (default: {_MAX_CACHE_ENTRIES})"
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -240,6 +366,10 @@ async def main():
             (time.monotonic() - t_warmup) * 1000
         )
 
+    # Shared state across all client handlers
+    synth_semaphore = asyncio.Semaphore(1)
+    cache = SynthesisCache(max_entries=args.max_cache)
+
     wyoming_voices = get_model_voices(kokoro_instance)
     wyoming_info = Info(
         tts=[TtsProgram(
@@ -256,8 +386,8 @@ async def main():
     )
 
     _LOGGER.info(
-        "Starting on %s (voice=%s, speed=%.1f)",
-        args.uri, args.voice, args.speed
+        "Starting on %s (voice=%s, speed=%.1f, cache=%d)",
+        args.uri, args.voice, args.speed, args.max_cache
     )
     server = AsyncServer.from_uri(args.uri)
 
@@ -277,6 +407,8 @@ async def main():
             kokoro_instance,
             args.voice,
             args.speed,
+            synth_semaphore,
+            cache,
         )
     )
 
