@@ -44,6 +44,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using version: $VERSION"
+
       - name: Set image name
         run: |
           if [ "${{ matrix.registry }}" = "docker.io" ]; then
@@ -65,10 +72,13 @@ jobs:
         with:
           images: ${{ env.FULL_IMAGE_NAME }}
           tags: |
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/release' }}
+            type=raw,value=${{ matrix.variant }}-${{ steps.version.outputs.version }},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/release' && matrix.variant != 'cpu' }}
+            type=raw,value=latest,enable=${{ matrix.variant == 'cpu' }}
+            type=raw,value=cuda,enable=${{ matrix.variant == 'cuda' }}
             type=ref,event=tag
             type=ref,event=branch
             type=semver,pattern={{version}}
-            type=raw,value=${{ matrix.variant }},enable=${{ matrix.variant != 'cpu' }}
 
       - name: Build and push Docker image
         id: push
