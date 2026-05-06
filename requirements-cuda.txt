@@ -1,0 +1,5 @@
+wyoming==1.6.0
+numpy>=2.0.2
+colorlog>=6.9.0
+espeakng-loader>=0.2.4
+phonemizer-fork==3.3.1

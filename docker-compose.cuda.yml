@@ -1,0 +1,15 @@
+services:
+  app:
+    image: ghcr.io/relvacode/kokoro-wyoming:cuda
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+    ports:
+      - "10210:10210"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      ONNX_PROVIDER: CUDAExecutionProvider
+      LD_LIBRARY_PATH: /usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.12/site-packages/nvidia/cufft/lib:/usr/local/lib/python3.12/site-packages/nvidia/curand/lib:/usr/local/lib/python3.12/site-packages/nvidia/nvjitlink/lib
+    gpus: all
+    restart: unless-stopped
