@@ -16,23 +16,15 @@ jobs:
       matrix:
         include:
           - registry: ghcr.io
-            username: ${{ github.actor }}
-            password: ${{ secrets.GITHUB_TOKEN }}
             variant: cpu
             dockerfile: Dockerfile
           - registry: ghcr.io
-            username: ${{ github.actor }}
-            password: ${{ secrets.GITHUB_TOKEN }}
             variant: cuda
             dockerfile: Dockerfile.cuda
           - registry: docker.io
-            username: ${{ secrets.DOCKERHUB_USERNAME }}
-            password: ${{ secrets.DOCKERHUB_TOKEN }}
             variant: cpu
             dockerfile: Dockerfile
           - registry: docker.io
-            username: ${{ secrets.DOCKERHUB_USERNAME }}
-            password: ${{ secrets.DOCKERHUB_TOKEN }}
             variant: cuda
             dockerfile: Dockerfile.cuda
     permissions:
@@ -59,12 +51,20 @@ jobs:
             echo "FULL_IMAGE_NAME=${{ matrix.registry }}/${{ env.IMAGE_NAME }}" >> $GITHUB_ENV
           fi
 
-      - name: Log in to the Container registry
+      - name: Log in to GHCR
+        if: matrix.registry == 'ghcr.io'
         uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
         with:
           registry: ${{ matrix.registry }}
-          username: ${{ matrix.username }}
-          password: ${{ matrix.password }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: matrix.registry == 'docker.io'
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
