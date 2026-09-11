@@ -24,13 +24,40 @@ import numpy as np
 
 from wyoming.info import Attribution, TtsProgram, TtsVoice, TtsVoiceSpeaker, Describe, Info
 from wyoming.server import AsyncServer
-from wyoming.tts import Synthesize
+from wyoming.tts import (Synthesize, SynthesizeStart, SynthesizeChunk,
+                         SynthesizeStop, SynthesizeStopped)
+try:
+    from sentence_stream import SentenceBoundaryDetector
+except ImportError:  # fallback: simple punctuation splitter
+    SentenceBoundaryDetector = None
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 import re
 
 _LOGGER = log.getChild(__name__)
-VERSION = "0.3.0"
+VERSION = "0.3.0"  # Wyoming synthesize-streaming (SynthesizeStart/Chunk/Stop)
+
+
+class _SimpleSBD:
+    """Minimal sentence boundary detector (used only if sentence_stream is absent)."""
+
+    def __init__(self):
+        self._buf = ""
+
+    def add_chunk(self, text):
+        self._buf += text
+        out = []
+        while True:
+            m = re.search(r"[.!?][\"')\]]*\s+", self._buf)
+            if not m:
+                break
+            out.append(self._buf[: m.end()].strip())
+            self._buf = self._buf[m.end():]
+        return out
+
+    def finish(self):
+        rest, self._buf = self._buf.strip(), ""
+        return rest
 
 # Maximum text length to prevent resource exhaustion on extremely long inputs.
 _MAX_TEXT_LENGTH = 5000
@@ -145,6 +172,17 @@ class KokoroEventHandler(AsyncEventHandler):
         self.wyoming_info_event = wyoming_info.event()
         self._semaphore = synth_semaphore
         self._cache = cache
+        # streaming state (Wyoming synthesize-start / chunk / stop)
+        self._streaming = False
+        self._stream_voice = default_voice
+        self._sbd = None
+        self._audio_started = False
+        self._stream_t0 = 0.0
+        self._stream_first_audio = None
+        self._stream_sentences = 0
+
+    def _new_sbd(self):
+        return SentenceBoundaryDetector() if SentenceBoundaryDetector else _SimpleSBD()
 
     async def handle_event(self, event: Event) -> bool:
         """Handle Wyoming protocol events."""
@@ -153,17 +191,95 @@ class KokoroEventHandler(AsyncEventHandler):
             _LOGGER.debug("Sent info")
             return True
 
-        if not Synthesize.is_type(event.type):
+        try:
+            if SynthesizeStart.is_type(event.type):
+                start = SynthesizeStart.from_event(event)
+                self._streaming = True
+                self._stream_voice = (start.voice.name if start.voice and start.voice.name
+                                      else self.default_voice)
+                self._sbd = self._new_sbd()
+                self._audio_started = False
+                self._stream_t0 = time.monotonic()
+                self._stream_first_audio = None
+                self._stream_sentences = 0
+                _LOGGER.debug("Text stream started: voice=%s", self._stream_voice)
+                return True
+
+            if SynthesizeChunk.is_type(event.type):
+                if not self._streaming:
+                    return True
+                chunk = SynthesizeChunk.from_event(event)
+                for sentence in self._sbd.add_chunk(chunk.text):
+                    await self._stream_sentence(sentence)
+                return True
+
+            if SynthesizeStop.is_type(event.type):
+                if self._streaming:
+                    rest = self._sbd.finish()
+                    if rest:
+                        await self._stream_sentence(rest)
+                    if not self._audio_started:
+                        await self.write_event(AudioStart(
+                            rate=kokoro_onnx.config.SAMPLE_RATE, width=2, channels=1).event())
+                    await self.write_event(AudioStop().event())
+                    await self.write_event(SynthesizeStopped().event())
+                    first = ((self._stream_first_audio - self._stream_t0) * 1000
+                             if self._stream_first_audio else 0)
+                    _LOGGER.info(
+                        "Stream done: voice=%s, sentences=%d, first_audio=%.0fms, total=%.0fms, cache=%s",
+                        self._stream_voice, self._stream_sentences, first,
+                        (time.monotonic() - self._stream_t0) * 1000, self._cache.stats)
+                    self._streaming = False
+                return True
+
+            if Synthesize.is_type(event.type):
+                if self._streaming:
+                    return True  # compat copy of the full text; already streamed
+                return await self._handle_synthesize(event)
+
             _LOGGER.warning("Unexpected event: %s", event)
             return True
-
-        try:
-            return await self._handle_synthesize(event)
         except Exception as err:
             await self.write_event(
                 Error(text=str(err), code=err.__class__.__name__).event()
             )
             raise err
+
+    async def _stream_sentence(self, sentence: str) -> None:
+        """Synthesize one sentence of a text stream and push its audio."""
+        text = clean_text(sentence)
+        if not text:
+            return
+        voice_name = self._stream_voice
+        sr = kokoro_onnx.config.SAMPLE_RATE
+        if not self._audio_started:
+            await self.write_event(AudioStart(rate=sr, width=2, channels=1).event())
+            self._audio_started = True
+        cached = self._cache.get(text, voice_name, self.default_speed)
+        if cached is not None:
+            audio, _ = cached
+            if self._stream_first_audio is None:
+                self._stream_first_audio = time.monotonic()
+            await self.write_event(AudioChunk(
+                audio=(audio * 32767).astype(np.int16).tobytes(),
+                rate=sr, width=2, channels=1).event())
+            self._stream_sentences += 1
+            return
+        parts = []
+        async with self._semaphore:
+            stream = self.kokoro.create_stream(
+                text, voice=voice_name, speed=self.default_speed,
+                lang="en-us" if voice_name.startswith("a") else "en-gb")
+            async for audio, _sr in stream:
+                if self._stream_first_audio is None:
+                    self._stream_first_audio = time.monotonic()
+                parts.append(audio)
+                await self.write_event(AudioChunk(
+                    audio=(audio * 32767).astype(np.int16).tobytes(),
+                    rate=sr, width=2, channels=1).event())
+        if parts:
+            self._cache.put(text, voice_name, self.default_speed, np.concatenate(parts), sr)
+        self._stream_sentences += 1
 
     async def _handle_synthesize(self, event: Event) -> Optional[bool]:
         try:
@@ -382,6 +498,7 @@ async def main():
             installed=True,
             voices=sorted(wyoming_voices, key=lambda v: v.name),
             version=VERSION,
+            supports_synthesize_streaming=True,
         )]
     )
 
