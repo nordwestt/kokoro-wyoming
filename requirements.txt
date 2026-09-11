@@ -1,3 +1,4 @@
-wyoming==1.6.0
+wyoming>=1.7.0
 numpy>=2.0.2
 kokoro-onnx[gpu]==0.4.5
+sentence-stream>=1.0.0
