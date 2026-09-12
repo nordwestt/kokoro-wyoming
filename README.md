@@ -14,8 +14,15 @@ Docker image avaiable at:
 https://hub.docker.com/r/nordwestt/kokoro-wyoming 
 
 Latest improvements available at:
+
+### CPU:
 ```
-docker pull ghcr.io/relvacode/kokoro-wyoming:latest
+docker pull nordwestt/kokoro-wyoming:latest
+```
+
+### CUDA:
+```
+docker pull nordwestt/kokoro-wyoming:cuda
 ```
 
 ## Setup
